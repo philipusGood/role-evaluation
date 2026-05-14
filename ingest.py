@@ -297,20 +297,38 @@ def fetch_index_csv(year: int) -> list[dict]:
 def ingest(force: bool = False):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ── Check if already up to date ──────────────────────────────────────────
+    manifest = load_manifest()
+
+    # ── Fast path: skip the API call if manifest is less than 24 hours old ───
+    # The provincial data updates once a year (April). Checking the remote API
+    # on every container restart is unnecessary — once per day is plenty.
+    if not force and DB_PATH.exists() and manifest.get("last_modified"):
+        ingested_at_str = manifest.get("ingested_at", "")
+        try:
+            ingested_at = datetime.fromisoformat(ingested_at_str.rstrip("Z"))
+            age_hours = (datetime.utcnow() - ingested_at).total_seconds() / 3600
+            if age_hours < 24:
+                log(f"Database is current (checked {age_hours:.1f}h ago, skipping remote check).")
+                log(f"  Year: {manifest.get('year')}  Properties: {manifest.get('num_properties', 0):,}")
+                return
+        except (ValueError, TypeError):
+            pass  # malformed date — fall through to normal check
+
+    # ── Check remote metadata ─────────────────────────────────────────────────
     log("Checking dataset metadata...")
-    resource     = get_latest_zip_resource()
-    zip_url      = resource["url"]
+    resource      = get_latest_zip_resource()
+    zip_url       = resource["url"]
     last_modified = resource.get("last_modified", "")
 
     year_match = re.search(r"(\d{4})", zip_url)
     year = int(year_match.group(1)) if year_match else datetime.now().year
 
-    manifest = load_manifest()
     if not force and manifest.get("last_modified") == last_modified and DB_PATH.exists():
         log(f"Database is current (year={year}, last_modified={last_modified}).")
-        log(f"Properties loaded: {manifest.get('num_properties', 'unknown'):,}")
-        log("Use --force to re-ingest.")
+        log(f"  Properties: {manifest.get('num_properties', 0):,}")
+        # Refresh ingested_at so the 24h fast-path kicks in next time
+        manifest["ingested_at"] = datetime.utcnow().isoformat() + "Z"
+        save_manifest(manifest)
         return
 
     # ── Fetch municipality index ──────────────────────────────────────────────
