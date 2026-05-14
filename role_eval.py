@@ -83,6 +83,7 @@ STREET_TYPE_LABELS = {
     "RANG":  "Rang",
     "RT":    "Route",
     "ROUTE": "Route",
+    "RU":    "Rue",
     "RUE":   "Rue",
     "SENT":  "Sentier",
     "SQ":    "Square",
@@ -171,15 +172,16 @@ def format_result(row: sqlite3.Row) -> dict:
     d = dict(row)
 
     # Build human-readable address string
+    # French Quebec convention: "1328 Rue Sherbrooke Est" (direction after street name)
     parts = []
     if d.get("civic_number"):
         parts.append(d["civic_number"])
     st = d.get("street_type") or ""
     parts.append(STREET_TYPE_LABELS.get(st, st))
-    if d.get("street_direction"):
-        parts.append(DIRECTION_LABELS.get(d["street_direction"], d["street_direction"]))
     if d.get("street_name"):
         parts.append(d["street_name"].title())
+    if d.get("street_direction"):
+        parts.append(DIRECTION_LABELS.get(d["street_direction"], d["street_direction"]))
     address_str = " ".join(p for p in parts if p).strip()
 
     usage_code = d.get("usage_code") or ""
