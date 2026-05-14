@@ -255,7 +255,8 @@ HTML = r"""<!DOCTYPE html>
     <input type="text" id="query" name="query"
            placeholder="ex: 125 chemin des Coureurs  ou  5283-91-2643"
            required>
-    <p class="hint">Pour une recherche par matricule ou lot, la municipalité est optionnelle.</p>
+    <p class="hint">Pour une recherche par matricule ou lot, la municipalité est optionnelle.<br>
+    <strong>Note :</strong> Les arrondissements de Montréal (Plateau, Ville-Marie, Rosemont, etc.) sont inclus dans <em>Montréal</em>.</p>
 
     <button type="submit" id="btn">Rechercher</button>
   </form>

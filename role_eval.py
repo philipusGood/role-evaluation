@@ -329,6 +329,16 @@ def lookup_by_address(
         words = street_part.split()
         if words and words[0] in STREET_TYPE_LABELS:
             words = words[1:]
+
+        # Strip trailing cardinal direction (stored separately in street_direction column)
+        # e.g. "SHERBROOKE E" → "SHERBROOKE" (direction "E" is in its own DB column)
+        DIRECTIONS = {"E", "O", "N", "S", "NE", "NO", "SE", "SO",
+                      "EST", "OUEST", "NORD", "SUD"}
+        direction_hint = None
+        if words and words[-1] in DIRECTIONS:
+            direction_hint = words[-1]
+            words = words[:-1]
+
         street_search = " ".join(words).strip()
 
         if not street_search:
