@@ -1,96 +1,132 @@
 #!/usr/bin/env python3
 """
-role_eval.py — Quebec Municipal Rôle d'Évaluation Lookup Tool
+role_eval.py — Query module for Quebec Rôle d'Évaluation SQLite database.
 
-Supported platforms:
-  • Geocentralis  — MRC des Pays-d'en-Haut (10 municipalities)
-  • Geocentriq    — MRC Vallée-de-la-Gatineau (14+ municipalities)
-  • PG Municipal  — Rigaud and others (opens browser; has CAPTCHA)
+Accepts an address or matricule, returns evaluated value, land/building split,
+property details, and Registre Foncier URL.
 
 Usage:
-  python role_eval.py "saint-sauveur" "125 chemin des Coureurs"
-  python role_eval.py "gracefield" "123 rue Principale"
-  python role_eval.py "morin-heights" "5283-91-2643" --type matricule
-  python role_eval.py "saint-sauveur" "2313704"       --type lot
-
-Output:
-  Matricule      : 5283-91-2643
-  Numéro de lot  : 2313704
-  Registre Foncier: https://www.registrefoncier.gouv.qc.ca/...
+    python role_eval.py "5283-91-2643"
+    python role_eval.py "125 chemin des Coureurs" --muni "saint-sauveur"
+    python role_eval.py "125 chemin des Coureurs" --muni-code 77043
+    python role_eval.py "125 chemin des Coureurs" --muni "saint-sauveur" --json
+    python role_eval.py --status
 """
 
-import requests
-import re
-import sys
-import time
-import json
-import webbrowser
 import argparse
-from bs4 import BeautifulSoup
-
+import json
+import os
+import re
+import sqlite3
+from pathlib import Path
+from typing import Optional
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Municipality registry
+# Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-MUNICIPALITIES = {
-    # ── Geocentralis — MRC des Pays-d'en-Haut ────────────────────────────────
-    "esterel":                         {"platform": "geocentralis", "muni_id": "77011", "mrc_slug": "mrc-pays-d-en-haut"},
-    "lac-des-seize-iles":              {"platform": "geocentralis", "muni_id": "77055", "mrc_slug": "mrc-pays-d-en-haut"},
-    "morin-heights":                   {"platform": "geocentralis", "muni_id": "77050", "mrc_slug": "mrc-pays-d-en-haut"},
-    "piedmont":                        {"platform": "geocentralis", "muni_id": "77030", "mrc_slug": "mrc-pays-d-en-haut"},
-    "saint-adolphe-dhoward":           {"platform": "geocentralis", "muni_id": "77065", "mrc_slug": "mrc-pays-d-en-haut"},
-    "saint-sauveur":                   {"platform": "geocentralis", "muni_id": "77043", "mrc_slug": "mrc-pays-d-en-haut"},
-    "sainte-adele":                    {"platform": "geocentralis", "muni_id": "77022", "mrc_slug": "mrc-pays-d-en-haut"},
-    "sainte-anne-des-lacs":            {"platform": "geocentralis", "muni_id": "77035", "mrc_slug": "mrc-pays-d-en-haut"},
-    "sainte-marguerite-du-lac-masson": {"platform": "geocentralis", "muni_id": "77012", "mrc_slug": "mrc-pays-d-en-haut"},
-    "wentworth-nord":                  {"platform": "geocentralis", "muni_id": "77060", "mrc_slug": "mrc-pays-d-en-haut"},
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+DB_PATH  = DATA_DIR / "role_eval.db"
 
-    # ── Geocentriq — MRC Vallée-de-la-Gatineau ───────────────────────────────
-    "gracefield":       {"platform": "geocentriq", "muni_slug": "gracefield",       "mrc_slug": "vallee-de-la-gatineau"},
-    "maniwaki":         {"platform": "geocentriq", "muni_slug": "maniwaki",         "mrc_slug": "vallee-de-la-gatineau"},
-    "aumond":           {"platform": "geocentriq", "muni_slug": "aumond",           "mrc_slug": "vallee-de-la-gatineau"},
-    "blue-sea":         {"platform": "geocentriq", "muni_slug": "blue-sea",         "mrc_slug": "vallee-de-la-gatineau"},
-    "bois-franc":       {"platform": "geocentriq", "muni_slug": "bois-franc",       "mrc_slug": "vallee-de-la-gatineau"},
-    "bouchette":        {"platform": "geocentriq", "muni_slug": "bouchette",        "mrc_slug": "vallee-de-la-gatineau"},
-    "cayamant":         {"platform": "geocentriq", "muni_slug": "cayamant",         "mrc_slug": "vallee-de-la-gatineau"},
-    "egan-sud":         {"platform": "geocentriq", "muni_slug": "egan-sud",         "mrc_slug": "vallee-de-la-gatineau"},
-    "grand-remous":     {"platform": "geocentriq", "muni_slug": "grand-remous",     "mrc_slug": "vallee-de-la-gatineau"},
-    "kazabazua":        {"platform": "geocentriq", "muni_slug": "kazabazua",        "mrc_slug": "vallee-de-la-gatineau"},
-    "lac-sainte-marie": {"platform": "geocentriq", "muni_slug": "lac-sainte-marie", "mrc_slug": "vallee-de-la-gatineau"},
-    "low":              {"platform": "geocentriq", "muni_slug": "low",              "mrc_slug": "vallee-de-la-gatineau"},
-    "messines":         {"platform": "geocentriq", "muni_slug": "messines",         "mrc_slug": "vallee-de-la-gatineau"},
-    "montcerf-lytton":  {"platform": "geocentriq", "muni_slug": "montcerf-lytton",  "mrc_slug": "vallee-de-la-gatineau"},
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage code labels (MAMH classification)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # ── PG Municipal / ACCEO ─────────────────────────────────────────────────
-    "rigaud": {"platform": "pg_municipal", "muni_code": "U4051", "fourn_seq": "344"},
+USAGE_LABELS = {
+    "1000": "Résidentiel — 1 logement",
+    "1001": "Résidentiel — 2 logements",
+    "1002": "Résidentiel — 3 logements",
+    "1003": "Résidentiel — 4 logements",
+    "1004": "Résidentiel — 5 logements",
+    "1005": "Résidentiel — 6 logements",
+    "1010": "Résidentiel — 7 logements et plus",
+    "1040": "Résidentiel — maison mobile",
+    "1090": "Résidentiel — autre",
+    "2000": "Villégiature (chalet / résidence secondaire)",
+    "3000": "Commercial",
+    "3100": "Bureau / professionnel",
+    "3200": "Hôtel / hébergement",
+    "3400": "Commercial — grande surface",
+    "4000": "Industriel",
+    "4100": "Industriel léger",
+    "4200": "Industriel lourd",
+    "5000": "Institutionnel / gouvernemental",
+    "5100": "École / établissement d'enseignement",
+    "5200": "Hôpital / établissement de santé",
+    "5300": "Lieu de culte",
+    "6000": "Récréatif",
+    "6100": "Terrain de golf",
+    "7000": "Forêt",
+    "7100": "Forêt productive",
+    "8000": "Agriculture",
+    "8100": "Ferme / exploitation agricole",
+    "9000": "Terrain vacant",
+    "9100": "Terrain vacant non bâti",
+    "9200": "Stationnement",
 }
 
-ALIASES = {
-    "st-sauveur":       "saint-sauveur",
-    "ste-adele":        "sainte-adele",
-    "ste-anne-des-lacs":"sainte-anne-des-lacs",
-    "wentworth":        "wentworth-nord",
-    "lac-masson":       "sainte-marguerite-du-lac-masson",
-    "st-adolphe":       "saint-adolphe-dhoward",
+STREET_TYPE_LABELS = {
+    "AV":    "Avenue",
+    "AVE":   "Avenue",
+    "BD":    "Boulevard",
+    "BOUL":  "Boulevard",
+    "CARR":  "Carré",
+    "CH":    "Chemin",
+    "COTE":  "Côte",
+    "CRES":  "Croissant",
+    "IMP":   "Impasse",
+    "MONT":  "Montée",
+    "MTL":   "Montée",
+    "PL":    "Place",
+    "PLACE": "Place",
+    "PRIV":  "Privé",
+    "RANG":  "Rang",
+    "RT":    "Route",
+    "ROUTE": "Route",
+    "RUE":   "Rue",
+    "SENT":  "Sentier",
+    "SQ":    "Square",
+    "TERR":  "Terrasse",
+    "VOIE":  "Voie",
 }
 
+DIRECTION_LABELS = {
+    "E":  "Est",
+    "N":  "Nord",
+    "O":  "Ouest",
+    "S":  "Sud",
+    "NE": "Nord-Est",
+    "NO": "Nord-Ouest",
+    "SE": "Sud-Est",
+    "SO": "Sud-Ouest",
+}
+
+MATRICULE_RE = re.compile(r"^\d{1,4}-\d{1,2}-\d{1,4}$")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def normalize_muni(name: str) -> str:
-    key = name.lower().strip()
-    for src, rep in [('à','a'),('â','a'),('é','e'),('è','e'),('ê','e'),
-                     ('î','i'),('ô','o'),('ù','u'),('û','u'),('ç','c')]:
-        key = key.replace(src, rep)
-    key = re.sub(r"\s+", "-", key)
-    key = re.sub(r"[^a-z0-9\-]", "", key)
-    return ALIASES.get(key, key)
+def normalize_text(s: str) -> str:
+    if not s:
+        return ""
+    s = s.upper()
+    for src, rep in [
+        ("À", "A"), ("Â", "A"), ("Ä", "A"),
+        ("É", "E"), ("È", "E"), ("Ê", "E"), ("Ë", "E"),
+        ("Î", "I"), ("Ï", "I"),
+        ("Ô", "O"), ("Ö", "O"),
+        ("Ù", "U"), ("Û", "U"), ("Ü", "U"),
+        ("Ç", "C"),
+        ("'", " "), ("’", " "), ("-", " "),
+    ]:
+        s = s.replace(src, rep)
+    return re.sub(r"\s+", " ", s).strip()
 
 
-def build_registre_foncier_url(lot_number: str) -> str:
+def build_rf_url(lot_number: str) -> Optional[str]:
+    if not lot_number:
+        return None
     lot_clean = re.sub(r"\s+", "", str(lot_number))
     return (
         "https://www.registrefoncier.gouv.qc.ca/Pivots/Recherche/"
@@ -98,278 +134,323 @@ def build_registre_foncier_url(lot_number: str) -> str:
     )
 
 
-def _make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/html, */*",
-    })
-    return s
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Geocentralis adapter
-#
-# API flow:
-#   1. GET /public/sig-web/{mrc_slug}/{muni_id}/   → establishes public session
-#   2. GET /georole_web_2/recherche-rapide/{muni_id}/?term={q}
-#      → JSON: [{id, matricule, matricule_court, id_municipalite, text}, ...]
-#   3. Parse lot from text HTML: Lot(s):</span> 2 313 704
-#
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GeocentralisAdapter:
-    BASE = "https://portail.geocentralis.com"
-
-    def __init__(self, muni_id: str, mrc_slug: str):
-        self.muni_id  = muni_id
-        self.mrc_slug = mrc_slug
-        self.session  = _make_session()
-        self._ready   = False
-
-    # ── session init ──────────────────────────────────────────────────────────
-
-    def _ensure_session(self):
-        if self._ready:
-            return
-        url = f"{self.BASE}/public/sig-web/{self.mrc_slug}/{self.muni_id}/"
-        try:
-            self.session.get(url, timeout=15)
-        except requests.RequestException as e:
-            print(f"  [warn] session init failed: {e}", file=sys.stderr)
-        self._ready = True
-
-    # ── search ────────────────────────────────────────────────────────────────
-
-    def _recherche_rapide(self, query: str) -> list:
-        self._ensure_session()
-        url = f"{self.BASE}/georole_web_2/recherche-rapide/{self.muni_id}/"
-        params = {"term": query, "_": int(time.time() * 1000)}
-        resp = self.session.get(url, params=params, timeout=20,
-                                headers={"X-Requested-With": "XMLHttpRequest"})
-        resp.raise_for_status()
-        return resp.json()
-
-    # ── parsing ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse_lot(text_html: str) -> str | None:
-        """Extract lot number from the HTML blob returned by recherche-rapide."""
-        # Pattern: ...Lot(s):</span> 2 313 704...
-        m = re.search(r"Lot\(s\):\s*</span>\s*([\d\s]+)", text_html)
-        if m:
-            return m.group(1).strip().replace(" ", "").replace("\u00a0", "")
+def get_db() -> Optional[sqlite3.Connection]:
+    if not DB_PATH.exists():
         return None
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-    def _build_result(self, item: dict) -> dict:
-        lot = self._parse_lot(item.get("text", ""))
-        result = {
-            "platform":           "geocentralis",
-            "matricule":          item.get("matricule_court", ""),
-            "matricule_complet":  item.get("matricule", ""),
-            "lot":                lot,
-            "ue_id":              item.get("id"),
-        }
-        if lot:
-            result["registre_foncier_url"] = build_registre_foncier_url(lot)
-        return result
 
-    # ── public interface ──────────────────────────────────────────────────────
-
-    def lookup(self, query: str) -> dict:
-        try:
-            results = self._recherche_rapide(query)
-        except Exception as e:
-            return {"error": f"recherche-rapide failed: {e}"}
-
-        if not results:
-            return {"error": f"No properties found for: {query!r}"}
-
-        if len(results) == 1:
-            return self._build_result(results[0])
-
-        # Multiple results — show a numbered list and let the caller pick
+def db_status() -> dict:
+    manifest_path = DATA_DIR / "manifest.json"
+    if not DB_PATH.exists():
         return {
-            "multiple_results": True,
-            "count": len(results),
-            "results": [self._build_result(r) for r in results],
+            "ready":   False,
+            "message": "Database not found. Run: python ingest.py",
         }
+    manifest = {}
+    if manifest_path.exists():
+        manifest = json.loads(manifest_path.read_text())
+    return {
+        "ready":              True,
+        "year":               manifest.get("year"),
+        "num_properties":     manifest.get("num_properties"),
+        "num_municipalities": manifest.get("num_municipalities"),
+        "last_modified":      manifest.get("last_modified"),
+        "ingested_at":        manifest.get("ingested_at"),
+        "db_size_mb":         manifest.get("db_size_mb"),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Geocentriq adapter (CIM platform)
-#
-# API: GET https://app.geocentriq.com/api/v1/municipalities/{slug}/evaluations
-#        ?page_size=10&s={query}
+# Result formatting
 # ─────────────────────────────────────────────────────────────────────────────
 
-class GeocentriqAdapter:
-    BASE = "https://app.geocentriq.com"
+def format_result(row: sqlite3.Row) -> dict:
+    d = dict(row)
 
-    def __init__(self, muni_slug: str):
-        self.muni_slug = muni_slug
-        self.session   = _make_session()
-        self.session.headers.update({"Accept": "application/json"})
+    # Build human-readable address string
+    parts = []
+    if d.get("civic_number"):
+        parts.append(d["civic_number"])
+    st = d.get("street_type") or ""
+    parts.append(STREET_TYPE_LABELS.get(st, st))
+    if d.get("street_direction"):
+        parts.append(DIRECTION_LABELS.get(d["street_direction"], d["street_direction"]))
+    if d.get("street_name"):
+        parts.append(d["street_name"].title())
+    address_str = " ".join(p for p in parts if p).strip()
 
-    def lookup(self, query: str) -> dict:
-        url = f"{self.BASE}/api/v1/municipalities/{self.muni_slug}/evaluations"
-        try:
-            resp = self.session.get(url, params={"page_size": 10, "s": query},
-                                    timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            return {"error": f"Geocentriq API failed: {e}"}
+    usage_code = d.get("usage_code") or ""
 
-        results = data.get("results", [])
-        if not results:
-            return {"error": f"No results for: {query!r}"}
-
-        prop = results[0]
-        lot  = str(prop.get("no_lot") or prop.get("lot") or "").replace(" ", "")
-        mat  = str(prop.get("matricule") or "")
-
-        result = {
-            "platform":  "geocentriq",
-            "matricule": mat,
-            "lot":       lot,
-            "raw":       prop,
-        }
-        if lot:
-            result["registre_foncier_url"] = build_registre_foncier_url(lot)
-
-        if len(results) > 1:
-            result["note"] = f"{len(results)} results found; showing first match."
-
-        return result
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PG Municipal / ACCEO adapter
-#
-# Cloudflare Turnstile CAPTCHA → open browser, let user search manually.
-# ─────────────────────────────────────────────────────────────────────────────
-
-class PGMunicipalAdapter:
-    PG_BASE = "https://pdi.pgmunicipal.com/immosoft/controller/ImmoNetPub"
-
-    def __init__(self, muni_code: str, fourn_seq: str):
-        self.muni_code = muni_code
-        self.fourn_seq = fourn_seq
-
-    def lookup(self, query: str) -> dict:
-        url = (
-            f"{self.PG_BASE}/{self.muni_code}/trouverParAdresse"
-            f"?language=fr&fourn_seq={self.fourn_seq}"
-        )
-        print(f"\n  ⚠  PG Municipal uses Cloudflare CAPTCHA.")
-        print(f"  Opening browser → search for: {query!r}")
-        print(f"  URL: {url}")
-        webbrowser.open(url)
-        return {
-            "platform":       "pg_municipal",
-            "browser_opened": True,
-            "url":            url,
-            "note":           "Complete the search manually in the browser.",
-        }
+    return {
+        "muni_code":    d.get("muni_code"),
+        "muni_name":    d.get("muni_name"),
+        "seq_id":       d.get("seq_id"),       # unique evaluation unit ID
+        "matricule":    d.get("matricule"),
+        "unit_id":      d.get("unit_id"),      # condo unit differentiator (RL0104F)
+        "lot_number":   d.get("lot_number"),
+        "address":      address_str,
+        # Evaluation
+        "total_value":    d.get("total_value"),
+        "land_value":     d.get("land_value"),
+        "building_value": d.get("building_value"),
+        "taxable_value":  d.get("taxable_value"),
+        "ref_date":       d.get("ref_date"),
+        "role_year":      d.get("year"),
+        # Property details
+        "usage_code":     usage_code,
+        "usage_label":    USAGE_LABELS.get(usage_code) or (f"Code {usage_code}" if usage_code else None),
+        "year_built":     d.get("year_built"),
+        "living_area_m2": d.get("living_area_m2"),
+        "lot_area_m2":    d.get("lot_area_m2"),
+        "frontage_m":     d.get("frontage_m"),
+        "num_units":      d.get("num_units"),
+        # Links
+        "registre_foncier_url": build_rf_url(d.get("lot_number")),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main lookup
+# Municipality helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def lookup(municipality: str, query: str) -> dict:
-    key       = normalize_muni(municipality)
-    muni_info = MUNICIPALITIES.get(key)
+def resolve_muni_code(conn: sqlite3.Connection, name: str) -> Optional[str]:
+    norm = normalize_text(name)
+    row = conn.execute(
+        "SELECT code FROM municipalities WHERE nom_norm = ? LIMIT 1", (norm,)
+    ).fetchone()
+    if row:
+        return row["code"]
+    row = conn.execute(
+        "SELECT code FROM municipalities WHERE nom_norm LIKE ? ORDER BY LENGTH(nom) ASC LIMIT 1",
+        (f"%{norm}%",)
+    ).fetchone()
+    return row["code"] if row else None
 
-    if not muni_info:
-        return {
-            "error": (
-                f"Municipality {municipality!r} not found. "
-                f"Normalised key: {key!r}. "
-                f"Available: {', '.join(sorted(MUNICIPALITIES))}"
-            )
-        }
 
-    platform = muni_info["platform"]
+def search_municipalities(name: str, limit: int = 10) -> list:
+    conn = get_db()
+    if not conn:
+        return []
+    norm = normalize_text(name)
+    try:
+        rows = conn.execute(
+            "SELECT code, nom FROM municipalities WHERE nom_norm LIKE ? ORDER BY nom ASC LIMIT ?",
+            (f"%{norm}%", limit)
+        ).fetchall()
+        return [{"code": r["code"], "nom": r["nom"]} for r in rows]
+    finally:
+        conn.close()
 
-    if platform == "geocentralis":
-        adapter = GeocentralisAdapter(muni_info["muni_id"], muni_info["mrc_slug"])
-        return adapter.lookup(query)
 
-    if platform == "geocentriq":
-        adapter = GeocentriqAdapter(muni_info["muni_slug"])
-        return adapter.lookup(query)
-
-    if platform == "pg_municipal":
-        adapter = PGMunicipalAdapter(muni_info["muni_code"], muni_info["fourn_seq"])
-        return adapter.lookup(query)
-
-    return {"error": f"Unknown platform: {platform}"}
+def list_municipalities(limit: int = 1200) -> list:
+    conn = get_db()
+    if not conn:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT code, nom FROM municipalities ORDER BY nom ASC LIMIT ?", (limit,)
+        ).fetchall()
+        return [{"code": r["code"], "nom": r["nom"]} for r in rows]
+    finally:
+        conn.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pretty-print
+# Lookups
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_result(result: dict):
+_BASE_SELECT = """
+    SELECT p.*, m.nom AS muni_name
+    FROM properties p
+    LEFT JOIN municipalities m ON p.muni_code = m.code
+"""
+
+
+def lookup_by_matricule(matricule: str) -> dict:
+    conn = get_db()
+    if not conn:
+        return {"error": "Database not initialized. Run: python ingest.py"}
+    clean = matricule.strip()
+    try:
+        row = conn.execute(
+            _BASE_SELECT + "WHERE p.matricule = ? LIMIT 1", (clean,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"error": f"No property found for matricule: {clean}"}
+    return format_result(row)
+
+
+def lookup_by_lot(lot_number: str) -> dict:
+    conn = get_db()
+    if not conn:
+        return {"error": "Database not initialized. Run: python ingest.py"}
+    clean = re.sub(r"\s+", "", lot_number.strip())
+    try:
+        row = conn.execute(
+            _BASE_SELECT + "WHERE p.lot_number = ? LIMIT 1", (clean,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"error": f"No property found for lot: {clean}"}
+    return format_result(row)
+
+
+def lookup_by_address(
+    query:     str,
+    muni_code: Optional[str] = None,
+    muni_name: Optional[str] = None,
+    limit:     int = 10,
+) -> dict:
+    conn = get_db()
+    if not conn:
+        return {"error": "Database not initialized. Run: python ingest.py"}
+
+    try:
+        if not muni_code and muni_name:
+            muni_code = resolve_muni_code(conn, muni_name)
+        if not muni_code:
+            return {
+                "error": "Municipality required for address search. "
+                         "Pass muni_code (5-digit code) or muni_name."
+            }
+
+        q_norm = normalize_text(query)
+        civic_match  = re.match(r"^(\d+)\s*(.*)", q_norm)
+        civic_number = civic_match.group(1) if civic_match else None
+        street_part  = civic_match.group(2).strip() if civic_match else q_norm
+
+        # Strip leading street-type abbreviation
+        words = street_part.split()
+        if words and words[0] in STREET_TYPE_LABELS:
+            words = words[1:]
+        street_search = " ".join(words).strip()
+
+        if not street_search:
+            return {"error": "Could not parse a street name from the query."}
+
+        params: list = [muni_code, f"%{street_search}%"]
+        sql = _BASE_SELECT + "WHERE p.muni_code = ? AND p.street_name_norm LIKE ?"
+        if civic_number:
+            sql += " AND p.civic_number = ?"
+            params.append(civic_number)
+        sql += f" LIMIT {limit}"
+
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return {"error": f"No properties found matching: {query!r}"}
+
+    results = [format_result(r) for r in rows]
+    if len(results) == 1:
+        return results[0]
+    return {"multiple_results": True, "count": len(results), "results": results}
+
+
+def lookup(
+    query:     str,
+    muni_code: Optional[str] = None,
+    muni_name: Optional[str] = None,
+) -> dict:
+    """
+    Auto-detects query type:
+      XXXX-XX-XXXX  → matricule lookup (province-wide, no muni needed)
+      Pure digits   → lot number lookup
+      Otherwise     → address lookup (muni_code or muni_name required)
+    """
+    q = query.strip()
+    if MATRICULE_RE.match(q):
+        return lookup_by_matricule(q)
+    if re.match(r"^\d+$", q):
+        return lookup_by_lot(q)
+    return lookup_by_address(q, muni_code=muni_code, muni_name=muni_name)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI pretty-printer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_currency(v) -> str:
+    if v is None:
+        return "—"
+    return f"{int(v):,} $".replace(",", " ")
+
+
+def _print_result(result: dict):
     if "error" in result:
-        print(f"\n  ✗  Error: {result['error']}")
+        print(f"\n  ✗  {result['error']}\n")
         return
-
     if result.get("multiple_results"):
-        print(f"\n  Found {result['count']} results — showing all:\n")
-        for i, r in enumerate(result["results"], 1):
-            print(f"  [{i}]")
-            _print_fields(r)
+        print(f"\n  {result['count']} results found:\n")
+        for r in result["results"]:
+            _print_single(r)
+            print()
         return
-
-    print()
-    _print_fields(result)
+    _print_single(result)
 
 
-def _print_fields(r: dict):
+def _print_single(r: dict):
+    SEP = ("─" * 24, "─" * 22)
     rows = [
-        ("Platform",          r.get("platform", "")),
-        ("Matricule (court)", r.get("matricule", "")),
-        ("Matricule (complet)",r.get("matricule_complet", "")),
-        ("Numéro de lot",     r.get("lot", "")),
-        ("Registre Foncier",  r.get("registre_foncier_url", "")),
+        ("Municipality",   f"{r.get('muni_name') or ''} ({r.get('muni_code') or ''})"),
+        ("Address",        r.get("address") or "—"),
+        ("Matricule",      r.get("matricule") or "—"),
+        ("Lot number",     r.get("lot_number") or "—"),
+        ("Usage",          r.get("usage_label") or "—"),
+        ("Role year",      str(r.get("role_year") or "—")),
+        ("Ref. date",      r.get("ref_date") or "—"),
+        SEP,
+        ("Total value",    _fmt_currency(r.get("total_value"))),
+        ("  Land",         _fmt_currency(r.get("land_value"))),
+        ("  Building",     _fmt_currency(r.get("building_value"))),
+        ("  Taxable",      _fmt_currency(r.get("taxable_value"))),
+        SEP,
+        ("Year built",     str(r.get("year_built") or "—")),
+        ("Living area",    f"{r.get('living_area_m2')} m²" if r.get("living_area_m2") else "—"),
+        ("Lot area",       f"{r.get('lot_area_m2'):,.0f} m²" if r.get("lot_area_m2") else "—"),
+        ("Units",          str(r.get("num_units") or "—")),
+        ("Registre F.",    r.get("registre_foncier_url") or "—"),
     ]
-    if "note" in r:
-        rows.append(("Note", r["note"]))
-
+    print()
     for label, value in rows:
-        if value:
-            print(f"  {label:<22}: {value}")
+        if label == "─" * 24:
+            print(f"  {label}  {value}")
+        else:
+            print(f"  {label:<24}: {value}")
+    print()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Quebec Rôle d'Évaluation lookup — returns Matricule, Lot, Registre Foncier URL"
-    )
-    parser.add_argument("municipality", help='e.g. "saint-sauveur" or "gracefield"')
-    parser.add_argument("query",        help='Address, matricule, or lot number')
-    parser.add_argument("--json",       action="store_true", help="Output raw JSON")
+    parser = argparse.ArgumentParser(description="Quebec Rôle d'Évaluation lookup")
+    parser.add_argument("query", nargs="?", help="Address, matricule (XXXX-XX-XXXX), or lot number")
+    parser.add_argument("--muni",      help="Municipality name (for address search)")
+    parser.add_argument("--muni-code", dest="muni_code", help="5-digit municipality geo code")
+    parser.add_argument("--status",    action="store_true", help="Show DB status and exit")
+    parser.add_argument("--json",      action="store_true", help="Output JSON")
     args = parser.parse_args()
 
-    print(f"\nLooking up: {args.query!r} in {args.municipality!r} ...")
-    result = lookup(args.municipality, args.query)
+    if args.status:
+        st = db_status()
+        print(json.dumps(st, indent=2, ensure_ascii=False))
+        return
+
+    if not args.query:
+        parser.print_help()
+        return
+
+    result = lookup(args.query, muni_code=args.muni_code, muni_name=args.muni)
 
     if args.json:
-        # Remove raw API data before printing
-        result.pop("raw", None)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print_result(result)
+        _print_result(result)
 
 
 if __name__ == "__main__":

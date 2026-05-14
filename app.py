@@ -1,64 +1,72 @@
 #!/usr/bin/env python3
 """
-app.py — Flask web interface for role_eval.py
-Serves a browser UI + JSON API endpoint for DealEval integration.
+app.py — Flask web interface + JSON API for Quebec Rôle d'Évaluation.
+
+Endpoints:
+  GET  /                                        Browser UI
+  GET  /api/lookup?query=&muni_code=&muni_name= Main lookup (address / matricule / lot)
+  GET  /api/municipalities?q=                   Municipality search / autocomplete
+  GET  /api/status                              DB health check
+  GET  /health                                  Simple liveness probe
 """
 
-from flask import Flask, request, jsonify, render_template_string
-from role_eval import lookup, MUNICIPALITIES, normalize_muni
+from flask import Flask, jsonify, render_template_string, request
+
+from role_eval import (
+    db_status,
+    list_municipalities,
+    lookup,
+    search_municipalities,
+)
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTML UI (single-file, no external build step)
+# HTML UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Rôle d'Évaluation</title>
+  <title>Rôle d'Évaluation — Québec</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
       background: #f0f2f5;
+      min-height: 100vh;
       display: flex;
       justify-content: center;
       align-items: flex-start;
-      min-height: 100vh;
-      padding: 40px 16px;
+      padding: 40px 16px 80px;
     }
+
     .card {
-      background: white;
-      border-radius: 12px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+      background: #fff;
+      border-radius: 14px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.07);
       width: 100%;
-      max-width: 560px;
-      padding: 36px;
+      max-width: 600px;
+      padding: 36px 40px;
     }
-    h1 {
-      font-size: 1.4rem;
-      font-weight: 700;
-      color: #1a1a2e;
-      margin-bottom: 4px;
-    }
-    .sub {
-      color: #666;
-      font-size: 0.875rem;
-      margin-bottom: 28px;
-    }
+
+    h1 { font-size: 1.35rem; font-weight: 700; color: #111; }
+    .sub { color: #777; font-size: 0.85rem; margin-top: 4px; margin-bottom: 28px; }
+
     label {
       display: block;
-      font-size: 0.82rem;
+      font-size: 0.78rem;
       font-weight: 600;
-      color: #444;
-      margin-bottom: 6px;
       text-transform: uppercase;
-      letter-spacing: 0.04em;
+      letter-spacing: 0.05em;
+      color: #555;
+      margin-bottom: 6px;
     }
-    select, input[type="text"] {
+
+    input[type="text"], input[type="search"] {
       width: 100%;
       padding: 10px 14px;
       border: 1.5px solid #ddd;
@@ -66,20 +74,18 @@ HTML = """<!DOCTYPE html>
       font-size: 0.95rem;
       color: #222;
       background: #fafafa;
-      margin-bottom: 18px;
-      transition: border-color 0.15s;
-      appearance: none;
+      margin-bottom: 16px;
+      transition: border-color 0.15s, background 0.15s;
     }
-    select:focus, input[type="text"]:focus {
-      outline: none;
-      border-color: #4f46e5;
-      background: white;
-    }
-    button {
+    input:focus { outline: none; border-color: #4f46e5; background: #fff; }
+
+    .hint { font-size: 0.78rem; color: #999; margin-top: -12px; margin-bottom: 16px; }
+
+    button[type="submit"] {
       width: 100%;
       padding: 12px;
       background: #4f46e5;
-      color: white;
+      color: #fff;
       border: none;
       border-radius: 8px;
       font-size: 1rem;
@@ -87,209 +93,329 @@ HTML = """<!DOCTYPE html>
       cursor: pointer;
       transition: background 0.15s;
     }
-    button:hover { background: #4338ca; }
-    button:disabled { background: #a5b4fc; cursor: not-allowed; }
+    button[type="submit"]:hover  { background: #4338ca; }
+    button[type="submit"]:disabled { background: #a5b4fc; cursor: not-allowed; }
 
-    #result {
-      margin-top: 28px;
-      display: none;
-    }
-    .result-box {
+    /* ── Results ── */
+    #result { margin-top: 28px; }
+
+    .result-card {
       background: #f8f9ff;
       border: 1.5px solid #e0e3ff;
       border-radius: 10px;
-      padding: 20px 22px;
+      overflow: hidden;
     }
-    .result-box.error {
+    .result-card.error {
       background: #fff5f5;
       border-color: #fecaca;
     }
-    .field { margin-bottom: 14px; }
-    .field:last-child { margin-bottom: 0; }
-    .field-label {
-      font-size: 0.75rem;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #888;
-      margin-bottom: 3px;
+
+    .result-header {
+      padding: 16px 20px 14px;
+      border-bottom: 1px solid #e0e3ff;
     }
-    .field-value {
+    .result-header h2 {
       font-size: 1rem;
+      font-weight: 700;
       color: #1a1a2e;
-      font-weight: 500;
-      word-break: break-all;
     }
-    .field-value a {
-      color: #4f46e5;
-      text-decoration: none;
-      font-weight: 600;
+    .result-header .subaddr {
+      font-size: 0.82rem;
+      color: #666;
+      margin-top: 2px;
     }
-    .field-value a:hover { text-decoration: underline; }
     .badge {
       display: inline-block;
-      font-size: 0.72rem;
+      font-size: 0.7rem;
       padding: 2px 8px;
       border-radius: 99px;
       background: #e0e7ff;
       color: #4338ca;
       font-weight: 700;
-      vertical-align: middle;
-      margin-left: 6px;
       text-transform: uppercase;
+      vertical-align: middle;
+      margin-left: 8px;
     }
+
+    .eval-block {
+      padding: 18px 20px;
+      border-bottom: 1px solid #e0e3ff;
+    }
+    .eval-total {
+      font-size: 1.75rem;
+      font-weight: 800;
+      color: #1a1a2e;
+      letter-spacing: -0.5px;
+    }
+    .eval-label {
+      font-size: 0.75rem;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 4px;
+    }
+    .eval-sub {
+      display: flex;
+      gap: 24px;
+      margin-top: 10px;
+      flex-wrap: wrap;
+    }
+    .eval-sub-item .sl { font-size: 0.72rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.04em; }
+    .eval-sub-item .sv { font-size: 0.92rem; font-weight: 600; color: #444; }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      padding: 14px 20px;
+      gap: 12px 24px;
+    }
+    .detail-item .dl { font-size: 0.72rem; color: #aaa; text-transform: uppercase; letter-spacing: 0.04em; }
+    .detail-item .dv { font-size: 0.88rem; color: #333; font-weight: 500; margin-top: 2px; }
+
+    .result-footer {
+      padding: 12px 20px;
+      border-top: 1px solid #e0e3ff;
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .result-footer a {
+      font-size: 0.82rem;
+      color: #4f46e5;
+      text-decoration: none;
+      font-weight: 600;
+    }
+    .result-footer a:hover { text-decoration: underline; }
+    .result-footer .meta {
+      font-size: 0.78rem;
+      color: #aaa;
+      margin-left: auto;
+      align-self: center;
+    }
+
+    /* Multiple results */
+    .multi-notice { font-size: 0.82rem; color: #777; margin-bottom: 12px; font-style: italic; }
+    .result-item {
+      background: #fff;
+      border: 1.5px solid #e0e3ff;
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+      cursor: pointer;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+    .result-item:hover { border-color: #4f46e5; box-shadow: 0 2px 8px rgba(79,70,229,0.1); }
+    .result-item .ri-addr { font-size: 0.88rem; font-weight: 600; color: #222; }
+    .result-item .ri-val  { font-size: 1rem; font-weight: 700; color: #4f46e5; margin-top: 4px; }
+    .result-item .ri-meta { font-size: 0.75rem; color: #999; margin-top: 2px; }
+
+    /* Error */
+    .error-msg { padding: 20px; color: #991b1b; font-size: 0.92rem; }
+
+    /* Spinner */
     .spinner {
       display: inline-block;
-      width: 18px; height: 18px;
+      width: 16px; height: 16px;
       border: 3px solid rgba(255,255,255,0.4);
-      border-top-color: white;
+      border-top-color: #fff;
       border-radius: 50%;
-      animation: spin 0.7s linear infinite;
+      animation: spin 0.65s linear infinite;
       vertical-align: middle;
       margin-right: 8px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .multiple-notice {
-      font-size: 0.82rem;
-      color: #666;
-      margin-bottom: 12px;
-      font-style: italic;
-    }
-    .result-item {
-      border: 1px solid #e0e3ff;
+
+    /* DB not ready banner */
+    .banner {
+      background: #fef3c7;
+      border: 1px solid #fcd34d;
       border-radius: 8px;
-      padding: 14px 16px;
-      margin-bottom: 10px;
-      background: white;
-      cursor: pointer;
-      transition: border-color 0.15s;
+      padding: 12px 16px;
+      font-size: 0.85rem;
+      color: #92400e;
+      margin-bottom: 20px;
     }
-    .result-item:hover { border-color: #4f46e5; }
   </style>
 </head>
 <body>
 <div class="card">
-  <h1>🏡 Rôle d'Évaluation</h1>
-  <p class="sub">Matricule · Numéro de lot · Registre Foncier</p>
+  <h1>🏡 Rôle d'Évaluation — Québec</h1>
+  <p class="sub">Valeur municipale · Terrain &amp; bâtiment · Registre Foncier</p>
 
-  <form id="searchForm">
-    <label for="municipality">Municipalité</label>
-    <select id="municipality" name="municipality" required>
-      <option value="">Choisir une municipalité...</option>
-      <optgroup label="Geocentralis — MRC des Pays-d'en-Haut">
-        <option value="saint-sauveur">Saint-Sauveur</option>
-        <option value="sainte-adele">Sainte-Adèle</option>
-        <option value="morin-heights">Morin-Heights</option>
-        <option value="piedmont">Piedmont</option>
-        <option value="sainte-anne-des-lacs">Sainte-Anne-des-Lacs</option>
-        <option value="sainte-marguerite-du-lac-masson">Sainte-Marguerite-du-Lac-Masson</option>
-        <option value="wentworth-nord">Wentworth-Nord</option>
-        <option value="saint-adolphe-dhoward">Saint-Adolphe-d'Howard</option>
-        <option value="lac-des-seize-iles">Lac-des-Seize-Îles</option>
-        <option value="esterel">Estérel</option>
-      </optgroup>
-      <optgroup label="Geocentriq — MRC Vallée-de-la-Gatineau">
-        <option value="gracefield">Gracefield</option>
-        <option value="maniwaki">Maniwaki</option>
-        <option value="aumond">Aumond</option>
-        <option value="blue-sea">Blue-Sea</option>
-        <option value="bois-franc">Bois-Franc</option>
-        <option value="bouchette">Bouchette</option>
-        <option value="cayamant">Cayamant</option>
-        <option value="egan-sud">Egan-Sud</option>
-        <option value="grand-remous">Grand-Remous</option>
-        <option value="kazabazua">Kazabazua</option>
-        <option value="lac-sainte-marie">Lac-Sainte-Marie</option>
-        <option value="low">Low</option>
-        <option value="messines">Messines</option>
-        <option value="montcerf-lytton">Montcerf-Lytton</option>
-      </optgroup>
-      <optgroup label="PG Municipal">
-        <option value="rigaud">Rigaud (opens browser)</option>
-      </optgroup>
-    </select>
+  <div id="banner" style="display:none" class="banner">
+    ⏳ La base de données est en cours de chargement. Revenez dans quelques minutes.
+  </div>
+
+  <form id="searchForm" autocomplete="off">
+    <label for="muni">Municipalité</label>
+    <input type="search" id="muni" name="muni" placeholder="ex: Saint-Sauveur" list="muni-list">
+    <datalist id="muni-list"></datalist>
 
     <label for="query">Adresse, matricule ou numéro de lot</label>
     <input type="text" id="query" name="query"
-           placeholder="ex: 125 chemin des Coureurs"
-           required autocomplete="off">
+           placeholder="ex: 125 chemin des Coureurs  ou  5283-91-2643"
+           required>
+    <p class="hint">Pour une recherche par matricule ou lot, la municipalité est optionnelle.</p>
 
-    <button type="submit" id="searchBtn">Rechercher</button>
+    <button type="submit" id="btn">Rechercher</button>
   </form>
 
   <div id="result"></div>
 </div>
 
 <script>
+// ── Municipality autocomplete ─────────────────────────────────────────────
+let allMunis = [];
+
+async function loadMunis() {
+  try {
+    const res = await fetch('/api/municipalities');
+    allMunis = await res.json();
+    const dl = document.getElementById('muni-list');
+    dl.innerHTML = allMunis.map(m =>
+      `<option value="${m.nom}" data-code="${m.code}">`
+    ).join('');
+  } catch(e) {}
+}
+loadMunis();
+
+async function checkStatus() {
+  try {
+    const res = await fetch('/api/status');
+    const data = await res.json();
+    if (!data.ready) {
+      document.getElementById('banner').style.display = 'block';
+    }
+  } catch(e) {}
+}
+checkStatus();
+
+// ── Search ────────────────────────────────────────────────────────────────
 const form = document.getElementById('searchForm');
-const btn  = document.getElementById('searchBtn');
+const btn  = document.getElementById('btn');
 const out  = document.getElementById('result');
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const muni  = document.getElementById('municipality').value;
+  const muni  = document.getElementById('muni').value.trim();
   const query = document.getElementById('query').value.trim();
-  if (!muni || !query) return;
+  if (!query) return;
+
+  // Resolve muni code from datalist if possible
+  const opt = document.querySelector(`#muni-list option[value="${CSS.escape(muni)}"]`);
+  const muniCode = opt ? opt.getAttribute('data-code') : '';
 
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Recherche en cours...';
-  out.style.display = 'none';
+  btn.innerHTML = '<span class="spinner"></span>Recherche en cours…';
+  out.innerHTML = '';
 
   try {
-    const resp = await fetch(`/api/lookup?municipality=${encodeURIComponent(muni)}&query=${encodeURIComponent(query)}`);
-    const data = await resp.json();
-    out.style.display = 'block';
+    const params = new URLSearchParams({ query });
+    if (muniCode) params.set('muni_code', muniCode);
+    else if (muni) params.set('muni_name', muni);
+
+    const res  = await fetch(`/api/lookup?${params}`);
+    const data = await res.json();
     out.innerHTML = renderResult(data);
-  } catch (err) {
-    out.style.display = 'block';
-    out.innerHTML = `<div class="result-box error"><div class="field-value">Erreur réseau: ${err.message}</div></div>`;
+  } catch(err) {
+    out.innerHTML = `<div class="result-card error"><div class="error-msg">Erreur réseau: ${err.message}</div></div>`;
   } finally {
     btn.disabled = false;
     btn.textContent = 'Rechercher';
   }
 });
 
+// ── Rendering ─────────────────────────────────────────────────────────────
+function fmt(v) {
+  if (v == null) return '—';
+  return new Intl.NumberFormat('fr-CA', {style:'currency', currency:'CAD', maximumFractionDigits:0}).format(v);
+}
+
 function renderResult(data) {
   if (data.error) {
-    return `<div class="result-box error">
-      <div class="field-label">Erreur</div>
-      <div class="field-value">${data.error}</div>
-    </div>`;
+    return `<div class="result-card error"><div class="error-msg">✗ ${data.error}</div></div>`;
   }
-
   if (data.multiple_results) {
-    const items = data.results.map(r => renderFields(r)).join('');
-    return `<div class="multiple-notice">${data.count} résultats trouvés :</div>${items}`;
+    const items = data.results.map(r => renderItem(r)).join('');
+    return `<div class="multi-notice">${data.count} résultats — cliquez pour sélectionner :</div>${items}`;
   }
-
-  return `<div class="result-box">${renderFields(data)}</div>`;
+  return renderCard(data);
 }
 
-function renderFields(r) {
-  const platformBadge = r.platform ? `<span class="badge">${r.platform}</span>` : '';
+function renderItem(r) {
+  return `
+  <div class="result-item" onclick="this.closest('#result').innerHTML = renderCard(${JSON.stringify(r).replace(/"/g,'&quot;')})">
+    <div class="ri-addr">${r.address || '(adresse inconnue)'}</div>
+    <div class="ri-val">${fmt(r.total_value)}</div>
+    <div class="ri-meta">${r.usage_label || ''} · Matricule ${r.matricule || '—'}</div>
+  </div>`;
+}
+
+function renderCard(r) {
   const rfLink = r.registre_foncier_url
     ? `<a href="${r.registre_foncier_url}" target="_blank">Ouvrir dans le Registre Foncier →</a>`
-    : '—';
+    : '';
+
+  const details = [
+    ['Type d\'immeuble', r.usage_label],
+    ['Année de construction', r.year_built],
+    ['Superficie habitable', r.living_area_m2 ? `${r.living_area_m2} m²` : null],
+    ['Superficie du terrain', r.lot_area_m2 ? `${new Intl.NumberFormat('fr-CA').format(Math.round(r.lot_area_m2))} m²` : null],
+    ['Façade', r.frontage_m ? `${r.frontage_m} m` : null],
+    ['Logements', r.num_units],
+  ].filter(([,v]) => v != null).map(([l,v]) => `
+    <div class="detail-item">
+      <div class="dl">${l}</div>
+      <div class="dv">${v}</div>
+    </div>`).join('');
 
   return `
-    <div class="field">
-      <div class="field-label">Matricule ${platformBadge}</div>
-      <div class="field-value">${r.matricule || '—'}</div>
+  <div class="result-card">
+    <div class="result-header">
+      <h2>${r.address || '(adresse non disponible)'}
+        ${r.muni_name ? `<span class="badge">${r.muni_name}</span>` : ''}
+      </h2>
+      <div class="subaddr">Matricule ${r.matricule || '—'} · Lot ${r.lot_number || '—'}</div>
     </div>
-    <div class="field">
-      <div class="field-label">Matricule complet</div>
-      <div class="field-value" style="font-size:0.85rem; color:#666">${r.matricule_complet || r.matricule || '—'}</div>
+
+    <div class="eval-block">
+      <div class="eval-label">Valeur totale (rôle ${r.role_year || ''})</div>
+      <div class="eval-total">${fmt(r.total_value)}</div>
+      <div class="eval-sub">
+        <div class="eval-sub-item">
+          <div class="sl">Terrain</div>
+          <div class="sv">${fmt(r.land_value)}</div>
+        </div>
+        <div class="eval-sub-item">
+          <div class="sl">Bâtiment</div>
+          <div class="sv">${fmt(r.building_value)}</div>
+        </div>
+        <div class="eval-sub-item">
+          <div class="sl">Valeur imposable</div>
+          <div class="sv">${fmt(r.taxable_value)}</div>
+        </div>
+      </div>
     </div>
-    <div class="field">
-      <div class="field-label">Numéro de lot</div>
-      <div class="field-value">${r.lot || '—'}</div>
+
+    ${details ? `<div class="detail-grid">${details}</div>` : ''}
+
+    <div class="result-footer">
+      ${rfLink}
+      <span class="meta">Réf. ${r.ref_date || '—'}</span>
     </div>
-    <div class="field">
-      <div class="field-label">Registre Foncier</div>
-      <div class="field-value">${rfLink}</div>
-    </div>
-  `;
+  </div>`;
 }
+
+// Allow clicking multiple-result items inline
+document.addEventListener('click', (e) => {
+  const item = e.target.closest('.result-item');
+  if (!item) return;
+  const onclick = item.getAttribute('onclick');
+  if (onclick) {
+    // handled inline — just call renderCard with the data
+    try { eval(onclick); } catch(err) {}
+  }
+});
 </script>
 </body>
 </html>"""
@@ -307,42 +433,47 @@ def index():
 @app.route("/api/lookup")
 def api_lookup():
     """
-    GET /api/lookup?municipality=saint-sauveur&query=125+chemin+des+Coureurs
+    GET /api/lookup?query=125+chemin+des+Coureurs&muni_name=saint-sauveur
+    GET /api/lookup?query=5283-91-2643
+    GET /api/lookup?query=2313704
 
-    Returns JSON:
-    {
-      "matricule":         "5283-91-2643",
-      "matricule_complet": "5283-91-2643-0-000-0000",
-      "lot":               "2313704",
-      "registre_foncier_url": "https://www.registrefoncier.gouv.qc.ca/..."
-    }
+    Returns JSON with evaluation data. Suitable for DealEval integration.
     """
-    municipality = request.args.get("municipality", "").strip()
-    query        = request.args.get("query", "").strip()
+    query     = request.args.get("query", "").strip()
+    muni_code = request.args.get("muni_code", "").strip() or None
+    muni_name = request.args.get("muni_name", "").strip() or None
 
-    if not municipality:
-        return jsonify({"error": "Missing parameter: municipality"}), 400
     if not query:
         return jsonify({"error": "Missing parameter: query"}), 400
 
-    result = lookup(municipality, query)
-
-    # Strip raw API data before sending to client
-    result.pop("raw", None)
-
+    result = lookup(query, muni_code=muni_code, muni_name=muni_name)
     return jsonify(result)
 
 
 @app.route("/api/municipalities")
 def api_municipalities():
-    """List all supported municipalities."""
-    munis = {k: v["platform"] for k, v in MUNICIPALITIES.items()}
+    """
+    GET /api/municipalities          → all municipalities (for autocomplete datalist)
+    GET /api/municipalities?q=saint  → filtered subset
+    """
+    q = request.args.get("q", "").strip()
+    if q:
+        munis = search_municipalities(q, limit=20)
+    else:
+        munis = list_municipalities()
     return jsonify(munis)
+
+
+@app.route("/api/status")
+def api_status():
+    return jsonify(db_status())
 
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "ok"})
+    st = db_status()
+    code = 200 if st.get("ready") else 503
+    return jsonify({"status": "ok" if st.get("ready") else "initializing", **st}), code
 
 
 # ─────────────────────────────────────────────────────────────────────────────

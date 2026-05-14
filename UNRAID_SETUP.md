@@ -1,100 +1,177 @@
-# Deploying on unRAID
+# Deploying on Unraid
 
-## Step 1 — Copy files to your unRAID share
+## Architecture overview
 
-Copy the entire `role_evaluation` folder to a share on your unRAID server.
-A good spot is `/mnt/user/appdata/role-evaluation/`.
-
-You can do this from your Mac:
 ```
-# In Finder: Go → Connect to Server → smb://your-unraid-ip
-# Then drag the role_evaluation folder into appdata
+Unraid server
+├── /mnt/user/appdata/role-evaluation/   ← source code (git repo)
+├── /mnt/user/appdata/role-eval-data/    ← persistent volume (SQLite DB, ~300 MB)
+└── Docker container: role-evaluation
+      port 7860 → Flask app + API
 ```
 
-Or via Terminal:
-```bash
-scp -r ~/Desktop/Cowork/role_evaluation root@your-unraid-ip:/mnt/user/appdata/role-evaluation
-```
+On first start the container downloads ~224 MB of Quebec property data and
+builds the SQLite DB (≈15 minutes). Subsequent starts check for updates and
+exit ingest in seconds if the data is current. The DB is rebuilt automatically
+each April when the provincial rôle refreshes.
 
 ---
 
-## Step 2 — Build the Docker image on unRAID
+## Step 1 — Push code to GitHub (from Mac)
 
-SSH into your unRAID server, then:
 ```bash
-cd /mnt/user/appdata/role-evaluation
-docker build -t role-evaluation:latest .
+cd ~/Desktop/Cowork/role_evaluation
+git add -A
+git commit -m "new provincial DB architecture"
+git push
 ```
 
-This takes ~60 seconds the first time (downloading Python base image).
+GitHub Actions will build the Docker image and push it to `ghcr.io/philipusgood/role-evaluation:latest`.
 
 ---
 
-## Step 3 — Add the container in unRAID
+## Step 2 — Create the data directory on Unraid
 
-In the unRAID web UI:
+SSH into Unraid, then:
 
-1. Go to **Docker** tab → **Add Container**
-2. Fill in:
+```bash
+mkdir -p /mnt/user/appdata/role-eval-data
+```
+
+This directory persists across container restarts. It will hold `role_eval.db`
+and `manifest.json` after the first ingest.
+
+---
+
+## Step 3 — Add the container in Unraid
+
+In the Unraid web UI go to **Docker → Add Container** and fill in:
 
 | Field | Value |
 |-------|-------|
 | Name | `role-evaluation` |
-| Repository | `role-evaluation:latest` |
+| Repository | `ghcr.io/philipusgood/role-evaluation:latest` |
 | Network Type | `bridge` |
-| Port Mapping — Host Port | `7860` |
-| Port Mapping — Container Port | `7860` |
+| Port — Host Port | `7860` |
+| Port — Container Port | `7860` |
+| Path — Container Path | `/data` |
+| Path — Host Path | `/mnt/user/appdata/role-eval-data` |
+| Variable — Key | `DATA_DIR` |
+| Variable — Value | `/data` |
 
-3. Click **Apply**
+Click **Apply**.
 
 ---
 
-## Step 4 — Use it
+## Step 4 — Watch the first-run ingest
+
+In Unraid, click the container name → **Logs**. You'll see output like:
+
+```
+[10:02:01] Checking dataset metadata...
+[10:02:03] Fetching municipality index for 2026...
+[10:02:04]   1140 municipalities listed.
+[10:02:04] Downloading https://donneesouvertes.affmunqc.net/role/Roles_Donnees_Ouvertes_2026.zip ...
+[10:02:14]   Download: 22 MB / 224 MB (10%)
+...
+[10:14:30] Ingest complete.
+[10:14:30]   Properties     : 3,521,847
+[10:14:30]   DB size        : 287.4 MB
+ * Running on http://0.0.0.0:7860
+```
+
+The app starts automatically once ingest finishes.
+
+---
+
+## Step 5 — Use it
 
 **Browser UI:**
 ```
-http://your-unraid-ip:7860
+http://10.0.1.73:7860
 ```
 
-**JSON API (for DealEval):**
+**JSON API (for DealEval / Levitas integration):**
+
+Search by address:
 ```
-GET http://your-unraid-ip:7860/api/lookup?municipality=saint-sauveur&query=125+chemin+des+Coureurs
+GET http://10.0.1.73:7860/api/lookup?query=125+chemin+des+Coureurs&muni_name=Saint-Sauveur
 ```
 
-Returns:
+Search by matricule (no municipality needed):
+```
+GET http://10.0.1.73:7860/api/lookup?query=5283-91-2643
+```
+
+Search by lot number:
+```
+GET http://10.0.1.73:7860/api/lookup?query=2313704
+```
+
+Example response:
 ```json
 {
+  "muni_code": "77043",
+  "muni_name": "Saint-Sauveur",
   "matricule": "5283-91-2643",
-  "matricule_complet": "5283-91-2643-0-000-0000",
-  "lot": "2313704",
+  "lot_number": "2313704",
+  "address": "125 Chemin Des Coureurs",
+  "total_value": 485000,
+  "land_value": 120000,
+  "building_value": 365000,
+  "taxable_value": 485000,
+  "ref_date": "2023-07-01",
+  "role_year": 2026,
+  "usage_code": "1000",
+  "usage_label": "Résidentiel — 1 logement",
+  "year_built": 1998,
+  "living_area_m2": 148.5,
+  "lot_area_m2": 3200.0,
   "registre_foncier_url": "https://www.registrefoncier.gouv.qc.ca/..."
 }
 ```
 
----
-
-## Updating the code later
-
-If you edit `role_eval.py` (e.g. to add a new municipality):
-
-```bash
-# SSH into unRAID
-cd /mnt/user/appdata/role-evaluation
-docker build -t role-evaluation:latest .
-docker restart role-evaluation
+**DB status check:**
+```
+GET http://10.0.1.73:7860/api/status
 ```
 
 ---
 
-## Auto-start on unRAID boot
+## Updating the data (annual, ~April)
 
-In the Docker container settings, set **Autostart** to `Yes`.
-unRAID will start the container automatically whenever the array comes online.
+The container checks for new data every time it starts. To force a refresh:
+
+Option A — restart the container (it will detect the new `last_modified` and re-ingest).
+
+Option B — SSH into Unraid and run:
+```bash
+docker exec role-evaluation python ingest.py --force
+```
 
 ---
 
-## Tip — Prettier local URL
+## Updating the code
 
-If you have a reverse proxy (Nginx Proxy Manager, Swag, etc.) on unRAID,
-you can give it a friendly local domain like `http://role-eval.local`
-instead of using the IP and port directly.
+Edit on Mac → push to GitHub → Force Update the container in Unraid Docker UI.
+The data volume is untouched by code updates.
+
+---
+
+## CLI usage (debugging)
+
+SSH into Unraid, then:
+
+```bash
+# Lookup by address
+docker exec role-evaluation python role_eval.py "125 chemin des Coureurs" --muni "Saint-Sauveur"
+
+# Lookup by matricule
+docker exec role-evaluation python role_eval.py "5283-91-2643"
+
+# Check DB status
+docker exec role-evaluation python role_eval.py --status
+
+# Force re-ingest
+docker exec role-evaluation python ingest.py --force
+```
